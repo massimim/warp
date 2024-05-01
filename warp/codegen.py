@@ -1290,6 +1290,19 @@ class Adjoint:
             adj.symbols[node.id] = out
             return out
 
+        if isinstance(obj, array):
+            # evaluate array constant
+            out = adj.add_var(type=obj, constant=obj)
+            adj.symbols[node.id] = out
+            return out
+
+        # see if it's a custom type object
+        if warp.types.type_is_external(type(obj)):
+            # evaluate as a constant
+            out = adj.add_constant(obj)
+            adj.symbols[node.id] = out
+            return out
+
         # the named object is either a function, class name, or module
         # pass it back to the caller for processing
         return obj
@@ -2378,6 +2391,35 @@ def constant_str(value):
     elif value == math.inf:
         return "INFINITY"
 
+    # !!! array constant
+    # FIXME: device mismatch?
+    elif isinstance(value, array):
+        if not value.ptr:
+            raise ValueError("Array cannot be empty")
+        if not value.is_contiguous:
+            raise ValueError("Array must be contiguous")
+
+        type_str = f"{Var.type_to_ctype(value)}"
+        dtype_str = f"{Var.type_to_ctype(value.dtype)}"
+        ptr_str = f"({dtype_str}*){value.ptr}"
+        shape_str = ", ".join([str(s) for s in value.shape])
+
+        return f"{type_str}({ptr_str}, {shape_str})"
+
+    # !!! custom type constant
+    # FIXME: device mismatch?
+    elif warp.types.type_is_external(type(value)):
+        # NOTE: we require that the custom type has a constructor that takes all the fields in declaration order
+        type_ctype = type(value)._type_
+        type_name = type(value).__name__
+        ctor_name = f"wp::{type_name}"
+        field_values = []
+        # TODO: this should work recursively if members are also custom types
+        for field_name, field_type in type_ctype._fields_:
+            field_values.append(getattr(value, field_name))
+        ctor_args = ", ".join([str(v) for v in field_values])
+        return f"{ctor_name}{{{ctor_args}}}"
+
     else:
         # otherwise just convert constant to string
         return str(value)
@@ -2392,11 +2434,27 @@ def indent(args, stops=1):
     return sep.join(args)
 
 
-# generates a C function name based on the python function name
-def make_full_qualified_name(func):
-    if not isinstance(func, str):
-        func = func.__qualname__
-    return re.sub("[^0-9a-zA-Z_]+", "", func.replace(".", "__"))
+local_counts = {}
+
+
+# generates a C identifier based on the python object name
+def make_full_qualified_name(obj):
+    if isinstance(obj, str):
+        name = obj
+    else:
+        name = obj.__qualname__
+
+    is_local = ".<locals>." in name
+
+    ident = re.sub("[^0-9a-zA-Z_]+", "", name.replace(".", "__"))
+
+    # locals are given a unique identifier
+    if is_local:
+        local_id = local_counts.get(ident, 0)
+        local_counts[ident] = local_id + 1
+        return f"{ident}_local{local_id}"
+    else:
+        return ident
 
 
 def codegen_struct(struct, device="cpu", indent_size=4):
